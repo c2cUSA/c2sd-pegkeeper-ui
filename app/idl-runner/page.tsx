@@ -1,247 +1,314 @@
-"use client";
+'use client';
 
+/* 
+  PegKeeper IDL Runner (Next.js App Router)
+  - Works with @coral-xyz/anchor 0.28/0.29 2-arg Program(...) ctor
+  - Sets (idl as any).address = programId
+  - Phantom-only minimal wallet adapter (no extra libs)
+  - Loads IDL from /idl/pegkeeper.json (put this file under /public/idl/pegkeeper.json)
+*/
+
+import React, { useEffect, useMemo, useState } from 'react';
 import * as anchor from '@coral-xyz/anchor';
-import { Connection, PublicKey } from '@solana/web3.js';
-// If you use wallet-adapter, import your wallet context/hook here
-// import { useWallet } from '@solana/wallet-adapter-react';
+import { Connection, PublicKey, ComputeBudgetProgram, Transaction } from '@solana/web3.js';
 
-type Idl = anchor.Idl;
+type IdlLike = anchor.Idl & { address?: string };
+
+// --- tiny helpers ---
+const toCamel = (s: string) =>
+  s.replace(/_([a-z])/g, (_, c) => c.toUpperCase()).replace(/^([A-Z])/, (c) => c.toLowerCase());
+
+const isBNType = (t?: string) => !!t && /(u64|i64|u128|i128|u256|i256)/i.test(t);
+
+const parseArg = (raw: string, idlType?: string) => {
+  // BN-ish → BN; bool → boolean; num → number; else string
+  if (idlType?.toLowerCase() === 'bool') return raw === 'true' || raw === '1';
+  if (isBNType(idlType)) return new anchor.BN(raw);
+  if (/^(u8|u16|u32|i8|i16|i32|f32|f64)$/i.test(idlType || '')) return Number(raw);
+  // default: return as string (often pubkeys or enums)
+  return raw;
+};
+
+declare global {
+  interface Window {
+    solana?: {
+      isPhantom?: boolean;
+      publicKey?: PublicKey;
+      connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{ publicKey: PublicKey }>;
+      disconnect: () => Promise<void>;
+      signTransaction: (tx: Transaction) => Promise<Transaction>;
+      signAllTransactions?: (txs: Transaction[]) => Promise<Transaction[]>;
+    };
+  }
+}
 
 export default function IdlRunnerPage() {
-  // const { wallet, publicKey } = useWallet(); // example if you use wallet-adapter
-
-  async function runIx(programId: string, ixName: string, args: any[], accounts: Record<string,string>) {
-    // 1) Load IDL dynamically (keeps Vercel happy)
-    const idl: Idl = (await import('../../target/idl/pegkeeper.json')).default as any;
-
-    // 2) Ensure IDL has the program address so we can use the 2-arg ctor
-    (idl as any).address = programId; // <-- critical
-
-    // 3) Build provider on the client
-    const rpc = process.env.NEXT_PUBLIC_RPC_URL || 'https://api.mainnet-beta.solana.com';
-    const connection = new Connection(rpc, 'confirmed');
-
-    // Supply a wallet that implements anchor.Wallet (from your wallet adapter)
-    // For demo, this uses a dummy read-only wallet to allow IDL queries;
-    // replace with your real wallet for sending txs.
-    const dummyWallet: anchor.Wallet = {
-      publicKey: new PublicKey('11111111111111111111111111111111'),
-      signAllTransactions: async (txs) => txs,
-      signTransaction: async (tx) => tx,
-    };
-
-    const provider = new anchor.AnchorProvider(connection, dummyWallet, { commitment: 'confirmed' });
-    anchor.setProvider(provider);
-
-    // 4) Use the 2-arg Program(idl, provider) form that your installed types expect
-    const program = new anchor.Program(idl, provider);
-
-    // 5) Build and send the ix as before...
-    const ix = program.idl.instructions?.find(i => i.name === ixName);
-    if (!ix) throw new Error(`Instruction ${ixName} not found in IDL`);
-
-    // Convert string account pubkeys to PublicKey objects
-    const accs: Record<string, PublicKey> = {};
-    for (const [k, v] of Object.entries(accounts)) accs[k] = new PublicKey(v);
-
-    // @ts-ignore – type inference for args can be strict; you can type them if needed
-    const tx = await program.methods[ixName](...args).accounts(accs).transaction();
-    // If you have a real wallet, send it:
-    // const sig = await provider.sendAndConfirm(tx, [], { skipPreflight: true });
-    // console.log('SIG:', sig);
-    return { ok: true };
-  }
-
-  return (
-    <div className="p-6">
-      <h1 className="text-xl font-semibold">IDL Runner</h1>
-      {/* hook this up to your UI form and call runIx(...) */}
-    </div>
+  // ---------- defaults ----------
+  const [rpc, setRpc] = useState<string>(
+    process.env.NEXT_PUBLIC_RPC_URL || 'https://api.devnet.solana.com'
   );
-}
-
-import { useState, useMemo } from "react";
-import WalletCtx, { WalletUi } from "@/components/WalletProvider";
-import * as anchor from "@coral-xyz/anchor";
-import { useWallet, useConnection } from "@solana/wallet-adapter-react";
-import { PublicKey, SystemProgram } from "@solana/web3.js";
-
-type Idl = anchor.Idl;
-
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div style={{display:"grid", gridTemplateColumns:"220px 1fr", gap:12, alignItems:"center"}}>
-      <label>{label}</label>
-      <div>{children}</div>
-    </div>
+  const [programId, setProgramId] = useState<string>(
+    process.env.NEXT_PUBLIC_PROGRAM_ID || '' // you can prefill if you like
   );
-}
 
-export default function IdlRunner() {
-  const { connection } = useConnection();
-  const wallet = useWallet();
-  const [programId, setProgramId] = useState<string>(process.env.NEXT_PUBLIC_PROGRAM_ID || "");
-  const [idlText, setIdlText] = useState<string>("");
-  const [idl, setIdl] = useState<Idl | null>(null);
-  const [ixName, setIxName] = useState<string>("");
-  const [args, setArgs] = useState<Record<string, string>>({});
-  const [accounts, setAccounts] = useState<Record<string, string>>({});
-  const [status, setStatus] = useState<string>("");
-  const [sig, setSig] = useState<string>("");
+  // Loaded IDL
+  const [idl, setIdl] = useState<IdlLike | null>(null);
 
-  const instructions = useMemo(() => idl?.instructions || [], [idl]);
+  // UI: instructions, args, accounts
+  const [ixName, setIxName] = useState<string>('');
+  const [argValues, setArgValues] = useState<Record<string, string>>({});
+  const [acctValues, setAcctValues] = useState<Record<string, string>>({});
 
-  const loadIdlFromFile = async (file: File) => {
-    const text = await file.text();
-    setIdlText(text);
+  // Wallet & status
+  const [walletPk, setWalletPk] = useState<string>('');
+  const [busy, setBusy] = useState<boolean>(false);
+  const [log, setLog] = useState<string>('');
+
+  // Load IDL from /public/idl/pegkeeper.json
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/idl/pegkeeper.json', { cache: 'no-store' });
+        if (!res.ok) throw new Error(`IDL fetch failed: ${res.status}`);
+        const json = (await res.json()) as IdlLike;
+        setIdl(json);
+        if (json.instructions?.length) setIxName(json.instructions[0].name);
+      } catch (e: any) {
+        setLog(`❌ Failed to load IDL: ${e?.message || String(e)}`);
+      }
+    })();
+  }, []);
+
+  const connection = useMemo(() => new Connection(rpc, 'confirmed'), [rpc]);
+
+  const connectPhantom = async () => {
     try {
-      const parsed = JSON.parse(text);
-      setIdl(parsed);
-      setIxName(parsed.instructions?.[0]?.name || "");
-      setStatus("IDL loaded ✓");
-    } catch (e:any) {
-      setStatus("Invalid JSON: " + e.message);
+      if (!window.solana?.isPhantom) {
+        setLog('❌ Phantom wallet not found. Please install Phantom.');
+        return;
+      }
+      const resp = await window.solana.connect();
+      setWalletPk(resp.publicKey.toBase58());
+      setLog(`✅ Connected: ${resp.publicKey.toBase58()}`);
+    } catch (e: any) {
+      setLog(`❌ Connect failed: ${e?.message || String(e)}`);
     }
   };
 
-  const loadIdlFromTextarea = () => {
+  const disconnectPhantom = async () => {
     try {
-      const parsed = JSON.parse(idlText);
-      setIdl(parsed);
-      setIxName(parsed.instructions?.[0]?.name || "");
-      setStatus("IDL loaded ✓");
-    } catch (e:any) {
-      setStatus("Invalid JSON: " + e.message);
+      if (window.solana?.disconnect) await window.solana.disconnect();
+      setWalletPk('');
+      setLog('👋 Disconnected');
+    } catch (e: any) {
+      setLog(`⚠️ Disconnect error: ${e?.message || String(e)}`);
     }
   };
 
-  const send = async () => {
-    setStatus("Sending...");
-    setSig("");
-    try {
-      if (!wallet.publicKey) throw new Error("Connect wallet first");
-      if (!programId) throw new Error("Program ID required");
-      if (!idl) throw new Error("Load IDL first");
-      if (!ixName) throw new Error("Choose an instruction");
+  const runInstruction = async () => {
+    if (!idl) return setLog('❌ IDL not loaded');
+    if (!programId) return setLog('❌ Set Program ID');
+    if (!window.solana?.publicKey) return setLog('❌ Connect Phantom first');
 
-      const provider = new anchor.AnchorProvider(connection, wallet as any, { commitment: "confirmed" });
+    setBusy(true);
+    setLog('⏳ Building transaction…');
+
+    try {
+      // Provider (Phantom as wallet)
+      const wallet = {
+        publicKey: window.solana.publicKey!,
+        signTransaction: window.solana.signTransaction!,
+        signAllTransactions: window.solana.signAllTransactions || (async (txs: Transaction[]) => {
+          const signed = [];
+          for (const tx of txs) signed.push(await window.solana!.signTransaction(tx));
+          return signed;
+        }),
+      } as any;
+
+      const provider = new anchor.AnchorProvider(connection, wallet, {
+        commitment: 'confirmed',
+      });
       anchor.setProvider(provider);
-      const program = new anchor.Program(idl as anchor.Idl, provider, new PublicKey(programId));
 
-      // Build args in the same order as IDL
-      const ix = idl.instructions!.find(i => i.name === ixName)!;
-      const argVals = (ix.args || []).map(a => {
-        const raw = args[a.name];
-        if (raw === undefined) throw new Error("Missing arg: " + a.name);
-        const typeStr = JSON.stringify(a.type);
-        if (typeStr.includes("u128") || typeStr.includes("i128") || typeStr.includes("u64") || typeStr.includes("i64")) {
-          // @ts-ignore
-          return new anchor.BN(raw);
-        }
-        if (typeStr === '"bool"') return raw === "true";
-        return raw;
+      // 2-arg Program: set idl.address first
+      (idl as any).address = programId;
+      const program = new anchor.Program(idl as anchor.Idl, provider);
+
+      // Build args list following the IDL order
+      const ix = idl.instructions?.find((i: any) => i.name === ixName);
+      if (!ix) throw new Error(`Instruction ${ixName} not found in IDL`);
+
+      const argsOrdered = (ix.args || []).map((a: any) =>
+        parseArg(argValues[a.name] ?? '', a.type?.defined ?? a.type?.type ?? a.type)
+      );
+
+      // Accounts object from user input
+      const accounts: Record<string, PublicKey> = {};
+      (ix.accounts || []).forEach((a: any) => {
+        const v = acctValues[a.name];
+        if (!v) throw new Error(`Missing account pubkey for '${a.name}'`);
+        accounts[a.name] = new PublicKey(v);
       });
 
-      // Dynamic method call
-      // @ts-ignore
-      let builder = program.methods[ixName](...argVals);
-
-      // Accounts
-      const accMap: any = {};
-      for (const acc of (ix.accounts || [])) {
-        const v = accounts[acc.name];
-        if (!v && acc.name === "systemProgram") {
-          accMap[acc.name] = SystemProgram.programId;
-          continue;
-        }
-        if (!v) throw new Error("Missing account: " + acc.name);
-        accMap[acc.name] = new PublicKey(v);
+      // Construct RPC call
+      // Prefer program.methods.<camelCase>(...args).accounts(accounts).preInstructions([...]).rpc()
+      const mName = toCamel(ixName);
+      const m = (program.methods as any)[mName];
+      if (typeof m !== 'function') {
+        throw new Error(`Method program.methods.${mName} not found. Check IDL names.`);
       }
 
-      const txSig = await builder.accounts(accMap).rpc();
-      setSig(txSig);
-      setStatus("Success ✓");
-    } catch (e:any) {
-      setStatus("Error: " + e.message);
+      // (optional) tip priority fee to make inclusion more reliable
+      const cuPriceIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 5_000 });
+
+      // Anchor .rpc() supports .preInstructions([...])
+      const txSig = await m(...argsOrdered).accounts(accounts).preInstructions([cuPriceIx]).rpc({
+        skipPreflight: true, // matches your hotfix guidance
+        maxRetries: 3,
+      });
+
+      setLog(`✅ Sent: https://explorer.solana.com/tx/${txSig}?cluster=${
+        rpc.includes('devnet') ? 'devnet' : rpc.includes('testnet') ? 'testnet' : 'mainnet'
+      }`);
+    } catch (e: any) {
+      setLog(`❌ Run failed: ${e?.message || String(e)}`);
+    } finally {
+      setBusy(false);
     }
   };
 
+  // form builders from IDL
+  const currentIx = useMemo(
+    () => idl?.instructions?.find((i: any) => i.name === ixName),
+    [idl, ixName]
+  );
+
   return (
-    <WalletCtx>
-      <div className="grid">
-        <section className="card" style={{gridColumn:"1/-1"}}>
-          <h2 style={{marginTop:0}}>IDL Runner (GUI)</h2>
-          <p className="muted">Upload your Anchor IDL JSON, choose an instruction, fill accounts/args, connect Phantom, and send to Devnet.</p>
-          <div style={{display:"flex", gap:12, alignItems:"center"}}>
-            <WalletUi />
-            <button className="btn" onClick={()=>navigator.clipboard.writeText(sig)} disabled={!sig}>Copy last tx</button>
-            {sig && <a className="btn" href={`https://explorer.solana.com/tx/${sig}?cluster=devnet`} target="_blank" rel="noreferrer">View on Explorer</a>}
-          </div>
-        </section>
+    <div className="min-h-screen p-6 max-w-4xl mx-auto font-sans">
+      <h1 className="text-2xl font-bold mb-4">PegKeeper — IDL Runner</h1>
 
-        <section className="card">
-          <h3 style={{marginTop:0}}>1) Load IDL</h3>
-          <Row label="Upload JSON">
-            <input type="file" accept=".json,application/json" onChange={e=>{
-              const f=e.target.files?.[0]; if (f) loadIdlFromFile(f);
-            }} />
-          </Row>
-          <Row label="Or paste JSON">
-            <textarea rows={6} value={idlText} onChange={e=>setIdlText(e.target.value)} placeholder="{ ... }"></textarea>
-          </Row>
-          <button className="btn" onClick={loadIdlFromTextarea}>Parse Pasted JSON</button>
-          <p className="muted" style={{marginTop:8}}>{status}</p>
-        </section>
-
-        <section className="card">
-          <h3 style={{marginTop:0}}>2) Program</h3>
-          <Row label="Program ID">
-            <input value={programId} onChange={e=>setProgramId(e.target.value)} placeholder="Your program id (Devnet)"/>
-          </Row>
-          <Row label="Instruction">
-            <select value={ixName} onChange={e=>{
-              setIxName(e.target.value);
-              setArgs({}); setAccounts({});
-            }}>
-              {instructions.map(ix => <option key={ix.name} value={ix.name}>{ix.name}</option>)}
-            </select>
-          </Row>
-        </section>
-
-        <section className="card">
-          <h3 style={{marginTop:0}}>3) Fill Inputs</h3>
-          {idl && ixName && (()=>{
-            const ix = idl.instructions!.find(i => i.name === ixName)!;
-            return (
-              <div className="grid">
-                <div className="card">
-                  <h4 style={{marginTop:0}}>Args</h4>
-                  {(ix.args || []).length === 0 && <p className="muted">No args</p>}
-                  {(ix.args || []).map(a => (
-                    <Row key={a.name} label={`${a.name} (${JSON.stringify(a.type)})`}>
-                      <input value={args[a.name]||""} onChange={e=>setArgs({...args,[a.name]:e.target.value})} placeholder="Enter value"/>
-                    </Row>
-                  ))}
-                </div>
-                <div className="card">
-                  <h4 style={{marginTop:0}}>Accounts</h4>
-                  {(ix.accounts || []).map(acc => (
-                    <Row key={acc.name} label={`${acc.name} ${acc.isMut?"[mut]":""} ${acc.isSigner?"[signer]":""}`}>
-                      <input value={accounts[acc.name]||""} onChange={e=>setAccounts({...accounts,[acc.name]:e.target.value})} placeholder={acc.name === "systemProgram" ? "autofilled" : "PublicKey"}/>
-                    </Row>
-                  ))}
-                </div>
-              </div>
-            );
-          })()}
-        </section>
-
-        <section className="card">
-          <h3 style={{marginTop:0}}>4) Send</h3>
-          <button className="btn btn-primary" onClick={send}>Send Transaction</button>
-          <p className="muted" style={{marginTop:8}}>{sig ? `Signature: ${sig}` : ""}</p>
-        </section>
+      {/* RPC & Program */}
+      <div className="grid gap-3 mb-4">
+        <label className="grid">
+          <span className="text-sm">RPC URL</span>
+          <input
+            className="border rounded px-3 py-2"
+            value={rpc}
+            onChange={(e) => setRpc(e.target.value)}
+            placeholder="https://api.devnet.solana.com"
+          />
+        </label>
+        <label className="grid">
+          <span className="text-sm">Program ID</span>
+          <input
+            className="border rounded px-3 py-2"
+            value={programId}
+            onChange={(e) => setProgramId(e.target.value)}
+            placeholder="Cf1aW47o... (your program)"
+          />
+        </label>
       </div>
-    </WalletCtx>
+
+      {/* Wallet */}
+      <div className="flex items-center gap-3 mb-6">
+        {walletPk ? (
+          <>
+            <span className="text-green-700 text-sm">Connected: {walletPk.slice(0, 8)}…{walletPk.slice(-6)}</span>
+            <button
+              className="border px-3 py-2 rounded"
+              onClick={disconnectPhantom}
+            >
+              Disconnect
+            </button>
+          </>
+        ) : (
+          <button className="border px-3 py-2 rounded" onClick={connectPhantom}>
+            Connect Phantom
+          </button>
+        )}
+      </div>
+
+      {/* Instruction selector */}
+      <div className="grid gap-3 mb-4">
+        <label className="grid">
+          <span className="text-sm">Instruction</span>
+          <select
+            className="border rounded px-3 py-2"
+            value={ixName}
+            onChange={(e) => setIxName(e.target.value)}
+          >
+            {idl?.instructions?.map((i: any) => (
+              <option key={i.name} value={i.name}>
+                {i.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {/* Dynamic args */}
+      {currentIx && currentIx.args?.length > 0 && (
+        <div className="border rounded p-3 mb-4">
+          <div className="font-semibold mb-2">Arguments</div>
+          <div className="grid md:grid-cols-2 gap-3">
+            {currentIx.args.map((a: any) => (
+              <label className="grid" key={a.name}>
+                <span className="text-xs opacity-70">
+                  {a.name} <em className="opacity-60">({typeof a.type === 'string' ? a.type : a.type?.defined || a.type?.type || 'unknown'})</em>
+                </span>
+                <input
+                  className="border rounded px-3 py-2"
+                  value={argValues[a.name] ?? ''}
+                  onChange={(e) =>
+                    setArgValues((s) => ({ ...s, [a.name]: e.target.value }))
+                  }
+                  placeholder="value…"
+                />
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Dynamic accounts */}
+      {currentIx && currentIx.accounts?.length > 0 && (
+        <div className="border rounded p-3 mb-6">
+          <div className="font-semibold mb-2">Accounts (Pubkeys)</div>
+          <div className="grid md:grid-cols-2 gap-3">
+            {currentIx.accounts.map((a: any) => (
+              <label className="grid" key={a.name}>
+                <span className="text-xs opacity-70">
+                  {a.name} {a.isMut ? ' (mut)' : ''} {a.isSigner ? ' (signer)' : ''}
+                </span>
+                <input
+                  className="border rounded px-3 py-2"
+                  value={acctValues[a.name] ?? ''}
+                  onChange={(e) =>
+                    setAcctValues((s) => ({ ...s, [a.name]: e.target.value }))
+                  }
+                  placeholder="PublicKey (e.g., 9x...Ab)"
+                />
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Run */}
+      <div className="flex gap-3">
+        <button
+          disabled={busy}
+          onClick={runInstruction}
+          className="bg-black text-white px-4 py-2 rounded disabled:opacity-60"
+        >
+          {busy ? 'Sending…' : 'Run Instruction'}
+        </button>
+      </div>
+
+      {/* Log */}
+      <pre className="mt-6 whitespace-pre-wrap text-sm p-3 border rounded bg-gray-50">
+        {log || 'Logs will appear here…'}
+      </pre>
+    </div>
   );
 }
