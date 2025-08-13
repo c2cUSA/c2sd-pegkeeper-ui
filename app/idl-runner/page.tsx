@@ -65,7 +65,7 @@ export default function IdlRunner() {
 
       const provider = new anchor.AnchorProvider(connection, wallet as any, { commitment: "confirmed" });
       anchor.setProvider(provider);
-      const program = new anchor.Program(idl, new PublicKey(programId), provider);
+      const program = new anchor.Program(idl as anchor.Idl, provider, new PublicKey(programId));
 
       // Build args in the same order as IDL
       const ix = idl.instructions!.find(i => i.name === ixName)!;
