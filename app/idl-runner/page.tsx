@@ -1,4 +1,65 @@
 "use client";
+
+import * as anchor from '@coral-xyz/anchor';
+import { Connection, PublicKey } from '@solana/web3.js';
+// If you use wallet-adapter, import your wallet context/hook here
+// import { useWallet } from '@solana/wallet-adapter-react';
+
+type Idl = anchor.Idl;
+
+export default function IdlRunnerPage() {
+  // const { wallet, publicKey } = useWallet(); // example if you use wallet-adapter
+
+  async function runIx(programId: string, ixName: string, args: any[], accounts: Record<string,string>) {
+    // 1) Load IDL dynamically (keeps Vercel happy)
+    const idl: Idl = (await import('../../target/idl/pegkeeper.json')).default as any;
+
+    // 2) Ensure IDL has the program address so we can use the 2-arg ctor
+    (idl as any).address = programId; // <-- critical
+
+    // 3) Build provider on the client
+    const rpc = process.env.NEXT_PUBLIC_RPC_URL || 'https://api.mainnet-beta.solana.com';
+    const connection = new Connection(rpc, 'confirmed');
+
+    // Supply a wallet that implements anchor.Wallet (from your wallet adapter)
+    // For demo, this uses a dummy read-only wallet to allow IDL queries;
+    // replace with your real wallet for sending txs.
+    const dummyWallet: anchor.Wallet = {
+      publicKey: new PublicKey('11111111111111111111111111111111'),
+      signAllTransactions: async (txs) => txs,
+      signTransaction: async (tx) => tx,
+    };
+
+    const provider = new anchor.AnchorProvider(connection, dummyWallet, { commitment: 'confirmed' });
+    anchor.setProvider(provider);
+
+    // 4) Use the 2-arg Program(idl, provider) form that your installed types expect
+    const program = new anchor.Program(idl, provider);
+
+    // 5) Build and send the ix as before...
+    const ix = program.idl.instructions?.find(i => i.name === ixName);
+    if (!ix) throw new Error(`Instruction ${ixName} not found in IDL`);
+
+    // Convert string account pubkeys to PublicKey objects
+    const accs: Record<string, PublicKey> = {};
+    for (const [k, v] of Object.entries(accounts)) accs[k] = new PublicKey(v);
+
+    // @ts-ignore – type inference for args can be strict; you can type them if needed
+    const tx = await program.methods[ixName](...args).accounts(accs).transaction();
+    // If you have a real wallet, send it:
+    // const sig = await provider.sendAndConfirm(tx, [], { skipPreflight: true });
+    // console.log('SIG:', sig);
+    return { ok: true };
+  }
+
+  return (
+    <div className="p-6">
+      <h1 className="text-xl font-semibold">IDL Runner</h1>
+      {/* hook this up to your UI form and call runIx(...) */}
+    </div>
+  );
+}
+
 import { useState, useMemo } from "react";
 import WalletCtx, { WalletUi } from "@/components/WalletProvider";
 import * as anchor from "@coral-xyz/anchor";
